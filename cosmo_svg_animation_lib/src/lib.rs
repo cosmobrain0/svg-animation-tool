@@ -1,15 +1,13 @@
 use leptos::prelude::*;
 use leptos_use::use_timestamp;
 
-pub trait Scene {
-    fn start(&mut self, scene_complete: Box<dyn Fn()>, time: Signal<f64>) -> AnyView;
-}
-
 struct SceneHandler {
-    scene: Box<dyn Scene + Send>,
+    scene: Box<dyn Send + 'static + Fn(&(dyn Fn() + 'static), Signal<f64>) -> AnyView>,
 }
 impl SceneHandler {
-    fn new(scene: Box<dyn Scene + Send + 'static>) -> Self {
+    fn new(
+        scene: Box<dyn Send + 'static + Fn(&(dyn Fn() + 'static), Signal<f64>) -> AnyView>,
+    ) -> Self {
         Self { scene }
     }
 
@@ -30,7 +28,7 @@ impl SceneHandler {
             }
         };
 
-        self.scene.start(Box::new(next_scene), time)
+        (self.scene)(&next_scene, time)
     }
 }
 
@@ -50,7 +48,9 @@ pub fn time_since(trigger: Signal<bool>) -> leptos::prelude::Signal<f64> {
 }
 
 #[component]
-pub fn SceneManager(sources: Vec<Box<dyn Scene + Send + 'static>>) -> impl IntoView {
+pub fn SceneManager(
+    sources: Vec<Box<dyn Send + 'static + Fn(&(dyn Fn() + 'static), Signal<f64>) -> AnyView>>,
+) -> impl IntoView {
     let active_scene = RwSignal::new(0usize);
     let mut sources = sources
         .into_iter()
@@ -102,6 +102,20 @@ impl Event {
         }
     }
 
+    pub fn from_trigger(trigger: Signal<bool>, global_time: Signal<f64>) -> Self {
+        let trigger_time = RwSignal::new(None);
+        Effect::new(move |was_set: Option<bool>| {
+            if trigger.get() && was_set.is_none_or(|x| !x) {
+                trigger_time.set(Some(global_time.get_untracked()));
+            }
+            trigger.get()
+        });
+        Self {
+            trigger_time,
+            global_time,
+        }
+    }
+
     pub fn triggered(&self) -> bool {
         self.trigger_time.get().is_some()
     }
@@ -115,6 +129,19 @@ impl Event {
             .get()
             .map(|t| self.global_time.get() - t)
             .unwrap_or(0.)
+    }
+
+    pub fn on(&self, response: impl Fn(f64, usize) + 'static) {
+        let initial_trigger_time = self.trigger_time.get_untracked();
+        let trigger_time = self.trigger_time;
+        Effect::new(move |count: Option<usize>| {
+            if trigger_time.get() != initial_trigger_time {
+                response(trigger_time.get().unwrap(), count.unwrap_or_default());
+                count.unwrap_or_default() + 1
+            } else {
+                count.unwrap_or_default()
+            }
+        });
     }
 
     pub fn time_untracked(&self) -> f64 {
@@ -164,4 +191,66 @@ macro_rules! signals {
     ($($name: ident $value: expr),*) => {
         $(let $name = RwSignal::new($value);)*
     }
+}
+
+pub fn tick(ms_between_ticks: f64, ms_before_first_tick: f64) -> Signal<u64> {
+    let timestamp = use_timestamp();
+    let first_tick = ms_before_first_tick + timestamp.get_untracked();
+    Memo::new(move |_| ((timestamp.get() - first_tick).max(0.0) / ms_between_ticks).floor() as u64)
+        .into()
+}
+
+pub fn tick_bool(ms_between_ticks: f64, ms_before_first_tick: f64) -> Signal<bool> {
+    let ticker = tick(ms_between_ticks, ms_before_first_tick);
+    Signal::derive(move || ticker.get().is_multiple_of(2))
+}
+
+pub fn tick_iterate<T: Send + Sync + Clone + 'static>(
+    ms_between_ticks: f64,
+    ms_before_first_tick: f64,
+    iterator: impl IntoIterator<Item = T>,
+) -> Option<Signal<T>> {
+    let values: Vec<_> = iterator.into_iter().collect();
+    if values.len() == 0 {
+        return None;
+    }
+    let ticker = tick(ms_between_ticks, ms_before_first_tick);
+    Some(Signal::derive(move || {
+        values[ticker.get() as usize % values.len()].clone()
+    }))
+}
+
+pub fn pausable_timer(global_time: Signal<f64>) -> (Signal<f64>, RwSignal<bool>) {
+    // we imaging that the timer was created
+    // then immediately paused and restarted
+    // so that we don't have to consider
+    // a timer which has never been paused before
+    let time_at_last_pause = RwSignal::new(0.);
+    let paused = RwSignal::new(false);
+    let paused_memo = Memo::new(move |_| paused.get());
+    let time_at_last_resume = RwSignal::new(global_time.get_untracked());
+    let accumulated_time = Signal::derive(move || {
+        time_at_last_pause.get()
+            + if paused.get() {
+                0.0
+            } else {
+                global_time.get() - time_at_last_resume.get()
+            }
+    });
+    Effect::new(move |_| {
+        if paused_memo.get() {
+            // paused_memo was false, but is now true: the timer was just paused!
+            leptos::logging::log!("just paused!");
+            time_at_last_pause.set(
+                time_at_last_pause.get_untracked() + global_time.get_untracked()
+                    - time_at_last_resume.get_untracked(),
+            );
+            leptos::logging::log!("last pause: {last_pause} | last_resume: {last_resume} | global_time: {global_time}", last_pause = time_at_last_pause.get_untracked().floor(), last_resume = time_at_last_resume.get_untracked().floor(), global_time = global_time.get_untracked());
+        } else {
+            // paused_memo was true, but is now false: the timer was just unpaused!
+            leptos::logging::log!("just UN-paused!");
+            time_at_last_resume.set(global_time.get_untracked());
+        }
+    });
+    (accumulated_time, paused)
 }
